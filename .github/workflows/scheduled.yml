@@ -1,0 +1,88 @@
+name: Scheduled run
+
+on:
+  schedule:
+    # Every 30 minutes, offset by :24/:54 so the five sibling agents
+    # (cert-sentinel, status-watch, ci-triage, alert-dedupe, backup-audit)
+    # don't all hit aiopsenabler.com / the GitHub API in the same minute.
+    - cron: "24,54 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install .
+
+      - name: Run backup-audit
+        id: audit
+        run: |
+          set -o pipefail
+          OUTPUT="$(backup-audit)"
+          echo "$OUTPUT"
+          OUTCOME="$(echo "$OUTPUT" | grep -oE 'outcome=[a-z]+' | cut -d= -f2)"
+          echo "outcome=${OUTCOME:-failure}" >> "$GITHUB_OUTPUT"
+
+      # --- Copyable AiOps Enabler reporting template --------------------
+      # This step is intentionally self-contained: paste it into ANY
+      # workflow, for ANY tool in ANY language, to report that job's
+      # outcome to https://aiopsenabler.com without touching the tool's
+      # own source. Implements the HMAC signing scheme from
+      # https://aiopsenabler.com/skill.md section 3 inline, using only
+      # Python's standard library (already present on GitHub-hosted
+      # runners -- no extra install step needed). To reuse elsewhere:
+      #   1. Copy this whole step.
+      #   2. Point TASK_OUTCOME at your own tool's result
+      #      (success | failure | escalated).
+      #   3. Set <YOUR_PREFIX>_AGENT_KEY_ID / _AGENT_SECRET as repo
+      #      secrets from your AiOps Enabler agent registration.
+      - name: Report to AiOps Enabler
+        if: always()
+        env:
+          AGENT_KEY_ID: ${{ secrets.BACKUP_AUDIT_AGENT_KEY_ID }}
+          AGENT_SECRET: ${{ secrets.BACKUP_AUDIT_AGENT_SECRET }}
+          TASK_OUTCOME: ${{ steps.audit.outputs.outcome }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, hmac, json, os, time, urllib.request, uuid
+
+          key_id = os.environ["AGENT_KEY_ID"]
+          secret = os.environ["AGENT_SECRET"]
+          outcome = os.environ.get("TASK_OUTCOME") or "failure"
+          base_url = "https://api.aiopsenabler.com"
+
+          def sign(body: bytes) -> dict:
+              timestamp = str(int(time.time()))
+              key = bytes.fromhex(hashlib.sha256(secret.encode()).hexdigest())
+              signature = hmac.new(key, f"{timestamp}.".encode() + body, hashlib.sha256).hexdigest()
+              return {
+                  "X-Agent-Key-Id": key_id,
+                  "X-Agent-Timestamp": timestamp,
+                  "X-Agent-Signature": signature,
+                  "Content-Type": "application/json",
+              }
+
+          def post_event(payload: dict) -> None:
+              body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+              request = urllib.request.Request(
+                  base_url + "/api/v1/events", data=body, headers=sign(body), method="POST"
+              )
+              with urllib.request.urlopen(request, timeout=10) as response:
+                  print(f"POST /api/v1/events ({payload['event_type']}) -> {response.status}")
+
+          task_id = str(uuid.uuid4())
+          post_event({"event_type": "task_started", "task_id": task_id})
+          post_event(
+              {
+                  "event_type": "task_completed",
+                  "task_id": task_id,
+                  "outcome": outcome,
+                  "duration_ms": 0,
+                  "category": "observability",
+              }
+          )
+          PY
