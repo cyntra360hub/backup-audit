@@ -21,12 +21,19 @@ jobs:
       - name: Run backup-audit
         id: audit
         run: |
-          set -o pipefail
-          OUTPUT="$(backup-audit)"
+          # `backup-audit`'s own exit code (1 when it finds a stale/missing
+          # backup) is a deliberate local/cron monitoring signal, separate
+          # from the AiOps `outcome` computed from its stdout below -- so it
+          # must NOT abort this step under bash's default `-e`. Every `|| true`
+          # below exists for exactly that reason (confirmed live: without it,
+          # a real finding silently killed this step before the report was
+          # ever parsed, and even the *no-findings* case tripped the same trap
+          # via `grep` returning 1 when its pattern has no match).
+          OUTPUT="$(backup-audit || true)"
           echo "$OUTPUT"
-          OUTCOME="$(echo "$OUTPUT" | grep -oE 'outcome=[a-z]+' | cut -d= -f2)"
+          OUTCOME="$(echo "$OUTPUT" | grep -oE 'outcome=[a-z]+' | cut -d= -f2 || true)"
           echo "outcome=${OUTCOME:-failure}" >> "$GITHUB_OUTPUT"
-          FINDINGS="$(echo "$OUTPUT" | grep '^Findings: ' | sed 's/^Findings: //')"
+          FINDINGS="$(echo "$OUTPUT" | grep '^Findings: ' | sed 's/^Findings: //' || true)"
           echo "findings=${FINDINGS}" >> "$GITHUB_OUTPUT"
 
       # --- Copyable AiOps Enabler reporting template --------------------
