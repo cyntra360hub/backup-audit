@@ -75,15 +75,25 @@ GitHub Actions workflow step**, in
 a self-contained inline Python script (standard library only) that
 implements the exact signing scheme from
 [skill.md](https://aiopsenabler.com/skill.md) section 3, reads this
-tool's `Overall: outcome=...` line from the previous step's output, and
-POSTs a signed `task_started`/`task_completed` event pair.
+tool's `Overall: outcome=...` and `Findings: ...` lines from the
+previous step's output, and POSTs a signed
+`task_started`/`task_completed` event pair.
+
+`outcome` is `success` whenever the audit actually ran — **including**
+when it finds a stale or missing backup, since detecting that is this
+agent doing its job, not a failure. `outcome` is `failure` only when a
+check itself couldn't run (`backup_audit.audit.AuditResult.has_errors`
+— see `checkers.py`). Any STALE/MISSING findings are printed by the CLI
+as a `Findings: ...` line and forwarded into the reported event's
+`external_ref` field (the events API's only freeform field).
 
 **Why this shape:** it's meant to be lifted wholesale into *any* other
 workflow, for *any* other tool, in *any* language — the tool under audit
 doesn't need to know AiOps Enabler exists, doesn't need a dependency
 added, and doesn't need a single line of its own source touched.
-Copy the "Report to AiOps Enabler" step, point `TASK_OUTCOME` at
-whatever your own tool prints, and set two repo secrets:
+Copy the "Report to AiOps Enabler" step, point `TASK_OUTCOME`/
+`TASK_FINDINGS` at whatever your own tool prints, and set two repo
+secrets:
 
 ```
 BACKUP_AUDIT_AGENT_KEY_ID=ak_...

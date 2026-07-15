@@ -26,6 +26,8 @@ jobs:
           echo "$OUTPUT"
           OUTCOME="$(echo "$OUTPUT" | grep -oE 'outcome=[a-z]+' | cut -d= -f2)"
           echo "outcome=${OUTCOME:-failure}" >> "$GITHUB_OUTPUT"
+          FINDINGS="$(echo "$OUTPUT" | grep '^Findings: ' | sed 's/^Findings: //')"
+          echo "findings=${FINDINGS}" >> "$GITHUB_OUTPUT"
 
       # --- Copyable AiOps Enabler reporting template --------------------
       # This step is intentionally self-contained: paste it into ANY
@@ -36,8 +38,10 @@ jobs:
       # Python's standard library (already present on GitHub-hosted
       # runners -- no extra install step needed). To reuse elsewhere:
       #   1. Copy this whole step.
-      #   2. Point TASK_OUTCOME at your own tool's result
-      #      (success | failure | escalated).
+      #   2. Point TASK_OUTCOME at your own tool's result (success |
+      #      failure -- reserve failure for the tool itself erroring
+      #      out; a completed run that *found* something is success,
+      #      with the finding described in TASK_FINDINGS instead).
       #   3. Set <YOUR_PREFIX>_AGENT_KEY_ID / _AGENT_SECRET as repo
       #      secrets from your AiOps Enabler agent registration.
       - name: Report to AiOps Enabler
@@ -46,6 +50,7 @@ jobs:
           AGENT_KEY_ID: ${{ secrets.BACKUP_AUDIT_AGENT_KEY_ID }}
           AGENT_SECRET: ${{ secrets.BACKUP_AUDIT_AGENT_SECRET }}
           TASK_OUTCOME: ${{ steps.audit.outputs.outcome }}
+          TASK_FINDINGS: ${{ steps.audit.outputs.findings }}
         run: |
           python3 - <<'PY'
           import hashlib, hmac, json, os, time, urllib.request, uuid
@@ -53,6 +58,7 @@ jobs:
           key_id = os.environ["AGENT_KEY_ID"]
           secret = os.environ["AGENT_SECRET"]
           outcome = os.environ.get("TASK_OUTCOME") or "failure"
+          findings = os.environ.get("TASK_FINDINGS") or ""
           base_url = "https://api.aiopsenabler.com"
 
           def sign(body: bytes) -> dict:
@@ -76,13 +82,14 @@ jobs:
 
           task_id = str(uuid.uuid4())
           post_event({"event_type": "task_started", "task_id": task_id})
-          post_event(
-              {
-                  "event_type": "task_completed",
-                  "task_id": task_id,
-                  "outcome": outcome,
-                  "duration_ms": 0,
-                  "category": "observability",
-              }
-          )
+          completed_payload = {
+              "event_type": "task_completed",
+              "task_id": task_id,
+              "outcome": outcome,
+              "duration_ms": 0,
+              "category": "observability",
+          }
+          if findings:
+              completed_payload["external_ref"] = findings[:255]
+          post_event(completed_payload)
           PY

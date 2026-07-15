@@ -2,8 +2,9 @@
 
 No AiOps Enabler reporting code lives here or anywhere else in this
 package -- see README "Optional: AiOps Enabler integration". This CLI's
-only contract with that integration is printing a stable, greppable
-"Overall: outcome=<value>" line, which `.github/workflows/scheduled.yml`
+only contract with that integration is printing two stable, greppable
+lines -- "Overall: outcome=<value>" and "Findings: <summary>" (only
+printed when there is one) -- which `.github/workflows/scheduled.yml`
 parses in plain shell.
 """
 
@@ -27,6 +28,8 @@ def _print_report(result: AuditResult) -> None:
         print(f"[{_STATUS_LABEL[check.status]}] {check.target.name}: {check.detail}{age}")
     print()
     print(f"Overall: outcome={result.outcome}")
+    if result.findings_summary:
+        print(f"Findings: {result.findings_summary}")
 
 
 def main() -> int:
