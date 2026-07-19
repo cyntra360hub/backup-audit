@@ -29,12 +29,17 @@ jobs:
           # a real finding silently killed this step before the report was
           # ever parsed, and even the *no-findings* case tripped the same trap
           # via `grep` returning 1 when its pattern has no match).
+          START_NS=$(date +%s%N)
           OUTPUT="$(backup-audit || true)"
+          END_NS=$(date +%s%N)
           echo "$OUTPUT"
           OUTCOME="$(echo "$OUTPUT" | grep -oE 'outcome=[a-z]+' | cut -d= -f2 || true)"
           echo "outcome=${OUTCOME:-failure}" >> "$GITHUB_OUTPUT"
           FINDINGS="$(echo "$OUTPUT" | grep '^Findings: ' | sed 's/^Findings: //' || true)"
           echo "findings=${FINDINGS}" >> "$GITHUB_OUTPUT"
+          DURATION_MS=$(( (END_NS - START_NS) / 1000000 ))
+          if [ "$DURATION_MS" -lt 1 ]; then DURATION_MS=1; fi
+          echo "duration_ms=${DURATION_MS}" >> "$GITHUB_OUTPUT"
 
       # --- Copyable AiOps Enabler reporting template --------------------
       # This step is intentionally self-contained: paste it into ANY
@@ -58,6 +63,7 @@ jobs:
           AGENT_SECRET: ${{ secrets.BACKUP_AUDIT_AGENT_SECRET }}
           TASK_OUTCOME: ${{ steps.audit.outputs.outcome }}
           TASK_FINDINGS: ${{ steps.audit.outputs.findings }}
+          TASK_DURATION_MS: ${{ steps.audit.outputs.duration_ms }}
         run: |
           python3 - <<'PY'
           import hashlib, hmac, json, os, time, urllib.request, uuid
@@ -66,6 +72,7 @@ jobs:
           secret = os.environ["AGENT_SECRET"]
           outcome = os.environ.get("TASK_OUTCOME") or "failure"
           findings = os.environ.get("TASK_FINDINGS") or ""
+          duration_ms = int(os.environ.get("TASK_DURATION_MS") or "1") or 1
           base_url = "https://api.aiopsenabler.com"
 
           def sign(body: bytes) -> dict:
@@ -93,7 +100,7 @@ jobs:
               "event_type": "task_completed",
               "task_id": task_id,
               "outcome": outcome,
-              "duration_ms": 0,
+              "duration_ms": duration_ms,
               "category": "observability",
           }
           if findings:

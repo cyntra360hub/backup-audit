@@ -56,12 +56,12 @@ class AuditResult:
         stale = [r.target.name for r in self.results if r.status == Status.STALE]
         if not missing and not stale:
             return None
-        parts = []
+        details = []
         if missing:
-            parts.append(f"missing: {', '.join(missing)}")
+            details.append(f"missing: {', '.join(missing)}")
         if stale:
-            parts.append(f"stale: {', '.join(stale)}")
-        return "; ".join(parts)[:255]
+            details.append(f"stale: {', '.join(stale)}")
+        return f"swept {len(self.results)} target(s) -- {'; '.join(details)}"[:255]
 
     @property
     def outcome(self) -> str:

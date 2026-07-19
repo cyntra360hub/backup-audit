@@ -37,7 +37,7 @@ def test_missing_target_is_success_with_findings(monkeypatch):
     assert result.has_missing_or_error
     assert not result.has_errors
     assert result.outcome == "success"
-    assert result.findings_summary == "missing: t"
+    assert result.findings_summary == "swept 1 target(s) -- missing: t"
 
 
 def test_error_target_is_failure(monkeypatch):
@@ -55,7 +55,7 @@ def test_stale_target_is_success_with_findings(monkeypatch):
     assert not result.all_ok
     assert not result.has_errors
     assert result.outcome == "success"
-    assert result.findings_summary == "stale: t"
+    assert result.findings_summary == "swept 1 target(s) -- stale: t"
 
 
 def test_findings_summary_lists_both_missing_and_stale(monkeypatch):
@@ -66,7 +66,7 @@ def test_findings_summary_lists_both_missing_and_stale(monkeypatch):
     monkeypatch.setitem(audit_mod._CHECKERS, TargetKind.GITHUB_RELEASE, checker)
     config = Config(targets=(_target("missing-one"), _target("stale-one")))
     result = run_audit(config)
-    assert result.findings_summary == "missing: missing-one; stale: stale-one"
+    assert result.findings_summary == "swept 2 target(s) -- missing: missing-one; stale: stale-one"
 
 
 def test_multiple_targets_all_present_in_results(monkeypatch):
