@@ -37,7 +37,8 @@ def test_missing_target_is_success_with_findings(monkeypatch):
     assert result.has_missing_or_error
     assert not result.has_errors
     assert result.outcome == "success"
-    assert result.findings_summary == "swept 1 target(s) -- missing: t"
+    assert result.findings_summary == "found 1 backup issue across 1 target -- e.g. t (missing)"
+    assert result.technical_summary == "missing: t"
 
 
 def test_error_target_is_failure(monkeypatch):
@@ -55,10 +56,11 @@ def test_stale_target_is_success_with_findings(monkeypatch):
     assert not result.all_ok
     assert not result.has_errors
     assert result.outcome == "success"
-    assert result.findings_summary == "swept 1 target(s) -- stale: t"
+    assert result.findings_summary == "found 1 backup issue across 1 target -- e.g. t (stale)"
+    assert result.technical_summary == "stale: t"
 
 
-def test_findings_summary_lists_both_missing_and_stale(monkeypatch):
+def test_findings_summary_names_only_one_example_with_a_count(monkeypatch):
     def checker(target: Target, now=None):
         status = Status.MISSING if target.name == "missing-one" else Status.STALE
         return CheckResult(target, status, "fake")
@@ -66,7 +68,19 @@ def test_findings_summary_lists_both_missing_and_stale(monkeypatch):
     monkeypatch.setitem(audit_mod._CHECKERS, TargetKind.GITHUB_RELEASE, checker)
     config = Config(targets=(_target("missing-one"), _target("stale-one")))
     result = run_audit(config)
-    assert result.findings_summary == "swept 2 target(s) -- missing: missing-one; stale: stale-one"
+    assert result.findings_summary == "found 2 backup issues across 2 targets -- e.g. missing-one (missing)"
+    assert "stale-one" not in result.findings_summary
+
+
+def test_technical_summary_lists_both_missing_and_stale(monkeypatch):
+    def checker(target: Target, now=None):
+        status = Status.MISSING if target.name == "missing-one" else Status.STALE
+        return CheckResult(target, status, "fake")
+
+    monkeypatch.setitem(audit_mod._CHECKERS, TargetKind.GITHUB_RELEASE, checker)
+    config = Config(targets=(_target("missing-one"), _target("stale-one")))
+    result = run_audit(config)
+    assert result.technical_summary == "missing: missing-one; stale: stale-one"
 
 
 def test_multiple_targets_all_present_in_results(monkeypatch):

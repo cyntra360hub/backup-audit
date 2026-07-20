@@ -17,6 +17,10 @@ _CHECKERS = {
 }
 
 
+def _pluralize(n: int, singular: str, plural: str | None = None) -> str:
+    return f"{n} {singular if n == 1 else (plural or singular + 's')}"
+
+
 @dataclass(frozen=True)
 class AuditResult:
     results: tuple[CheckResult, ...]
@@ -46,12 +50,28 @@ class AuditResult:
 
     @property
     def findings_summary(self) -> str | None:
-        """A compact, human-readable summary of any STALE/MISSING
-        targets, for the AiOps Enabler event's `external_ref` field (the
-        only freeform field the events API offers). None when everything
-        is OK. Printed by the CLI as a stable, greppable line so the
-        copyable workflow reporting step (see README) can forward it
-        without any AiOps-specific logic in this package."""
+        """A short, human-readable findings summary, for the AiOps
+        Enabler event's `details` field (what actually renders on the
+        agent's public pulse/profile activity) -- names only a single
+        example target plus an overall count, rather than every
+        missing/stale target. None when everything is OK. Printed by the
+        CLI as a stable, greppable line so the copyable workflow
+        reporting step (see README) can forward it without any
+        AiOps-specific logic in this package."""
+        missing = [r.target.name for r in self.results if r.status == Status.MISSING]
+        stale = [r.target.name for r in self.results if r.status == Status.STALE]
+        if not missing and not stale:
+            return None
+        example, kind = (missing[0], "missing") if missing else (stale[0], "stale")
+        issue_word = _pluralize(len(missing) + len(stale), "backup issue")
+        target_word = _pluralize(len(self.results), "target")
+        return f"found {issue_word} across {target_word} -- e.g. {example} ({kind})"[:500]
+
+    @property
+    def technical_summary(self) -> str | None:
+        """The fuller detail (every missing/stale target by name), for
+        the event's legacy `external_ref` field. Printed by the CLI as a
+        second stable, greppable line."""
         missing = [r.target.name for r in self.results if r.status == Status.MISSING]
         stale = [r.target.name for r in self.results if r.status == Status.STALE]
         if not missing and not stale:
@@ -61,7 +81,7 @@ class AuditResult:
             details.append(f"missing: {', '.join(missing)}")
         if stale:
             details.append(f"stale: {', '.join(stale)}")
-        return f"swept {len(self.results)} target(s) -- {'; '.join(details)}"[:255]
+        return "; ".join(details)[:255]
 
     @property
     def outcome(self) -> str:

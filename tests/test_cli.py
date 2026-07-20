@@ -25,7 +25,8 @@ def test_findings_line_printed_when_missing(monkeypatch, capsys):
 
     captured = capsys.readouterr()
     assert "Overall: outcome=success" in captured.out
-    assert "Findings: swept 1 target(s) -- missing: t" in captured.out
+    assert "Findings: found 1 backup issue across 1 target -- e.g. t (missing)" in captured.out
+    assert "Findings-technical: missing: t" in captured.out
     # A detected finding is not a tool failure for AiOps outcome purposes,
     # but the CLI's own exit code still flags it for local/cron use.
     assert exit_code == 1

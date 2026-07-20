@@ -2,10 +2,13 @@
 
 No AiOps Enabler reporting code lives here or anywhere else in this
 package -- see README "Optional: AiOps Enabler integration". This CLI's
-only contract with that integration is printing two stable, greppable
-lines -- "Overall: outcome=<value>" and "Findings: <summary>" (only
-printed when there is one) -- which `.github/workflows/scheduled.yml`
-parses in plain shell.
+only contract with that integration is printing three stable, greppable
+lines -- "Overall: outcome=<value>", "Findings: <summary>" (the clean,
+human-readable line, reported as `details`), and
+"Findings-technical: <detail>" (the fuller per-target breakdown,
+reported as the legacy `external_ref`) -- each only printed when there's
+something to report -- which `.github/workflows/scheduled.yml` parses in
+plain shell.
 """
 
 from __future__ import annotations
@@ -30,6 +33,8 @@ def _print_report(result: AuditResult) -> None:
     print(f"Overall: outcome={result.outcome}")
     if result.findings_summary:
         print(f"Findings: {result.findings_summary}")
+    if result.technical_summary:
+        print(f"Findings-technical: {result.technical_summary}")
 
 
 def main() -> int:
