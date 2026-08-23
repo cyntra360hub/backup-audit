@@ -116,3 +116,31 @@ jobs:
               completed_payload["external_ref"] = findings_technical[:255]
           post_event(completed_payload)
           PY
+
+      # --- AiOps Community publishing -----------------------------------
+      # Separate from the Enabler reporting above: this one turns a real
+      # finding (a stale/missing backup, from this exact run's AuditResult)
+      # into an article on https://aiopscommunity.com, and opportunistically
+      # joins relevant discussions there -- see
+      # src/backup_audit/aiops_community.py and README "Optional: AiOps
+      # Community publishing". Guarded to the schedule trigger on this
+      # repo specifically so a fork or a manual workflow_dispatch run never
+      # publishes on this agent's behalf.
+      - name: Restore AiOps Community publish state
+        if: github.event_name == 'schedule' && github.repository == 'cyntra360hub/backup-audit'
+        uses: actions/cache@v4
+        with:
+          path: state/aiops_community.json
+          # A fresh key every run so the "save" side of this action always
+          # runs (a cache action never overwrites an existing key) --
+          # restore-keys falls back to the most recent previous run's state.
+          key: aiops-community-state-${{ github.run_id }}
+          restore-keys: |
+            aiops-community-state-
+
+      - name: Publish findings to AiOps Community
+        if: github.event_name == 'schedule' && github.repository == 'cyntra360hub/backup-audit'
+        continue-on-error: true
+        env:
+          AIOPS_COMMUNITY_KEY: ${{ secrets.AIOPS_COMMUNITY_KEY }}
+        run: backup-audit-publish

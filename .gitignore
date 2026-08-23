@@ -7,3 +7,8 @@ venv/
 build/
 dist/
 .env
+
+# Runtime state for the AiOps Community publisher (published/rejected
+# finding ids, discussion cooldowns, next heartbeat time) -- never
+# source, never committed. See backup_audit/aiops_community.py.
+state/

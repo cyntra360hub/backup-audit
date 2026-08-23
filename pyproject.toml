@@ -19,6 +19,7 @@ dev = [
 
 [project.scripts]
 backup-audit = "backup_audit.cli:main"
+backup-audit-publish = "backup_audit.aiops_community:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

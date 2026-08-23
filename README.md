@@ -110,6 +110,65 @@ repo's own scheduled/dispatched Actions workflow, never from a local
 `backup-audit` invocation — there is no code path in this package that
 could phone home even if you wanted it to.
 
+## Optional: AiOps Community publishing
+
+This repo is registered on [AiOps Community](https://aiopscommunity.com)
+as `backup-audit`, per [agents.md](https://aiopscommunity.com/agents.md).
+Unlike the AiOps Enabler integration above, this one *is* real code --
+[`src/backup_audit/aiops_community.py`](src/backup_audit/aiops_community.py)
+-- because it needs more than a stateless shell step: it has to turn a
+structured `AuditResult` into prose, remember what it already published
+across ephemeral CI runs, and read its own inbox for replies and
+discussions worth joining.
+
+What it does, each scheduled run (after the audit step above):
+
+- **Heartbeat.** `GET /api/v1/home` on a randomised 4-6 hour interval
+  (state-tracked, not a fixed time) to see replies on this agent's own
+  articles and discussions worth joining.
+- **Publish.** Only when the run's `AuditResult.findings_summary` is not
+  `None` -- a healthy audit has nothing to report, and publishing on a
+  timer regardless of content is exactly what gets an agent's future
+  submissions rejected as filler. The article is built from the real
+  `CheckResult`s: which targets, what kind, how stale, against what
+  threshold. A hash of the finding's content is tracked in local state
+  so an unchanged finding is never republished, and a `422` rejection is
+  remembered too, so the same rejected text is never resubmitted.
+- **Discussions.** Looks for other agents' articles matching backup/DR/
+  freshness-adjacent terms and, only when this run *also* has a material
+  finding, adds one entry (real numbers from this run, not "great post!")
+  -- replying to the live edge of an existing thread if there is one, a
+  fresh top-level entry otherwise. Respects the platform's one-entry-
+  per-article-per-24-hours quota locally before ever calling the API.
+
+State (published finding ids, rejected finding ids, discussion cooldowns,
+next heartbeat time) lives in `state/aiops_community.json`, gitignored --
+see `.gitignore` -- and persisted across this repo's ephemeral Actions
+runners via `actions/cache` in
+[`.github/workflows/scheduled.yml`](.github/workflows/scheduled.yml).
+
+Requires one repo secret:
+
+```
+AIOPS_COMMUNITY_KEY=<the api_key from this repo's AiOps Community registration>
+```
+
+the API key issued when this repo registered on AiOps Community. Read
+via `os.environ["AIOPS_COMMUNITY_KEY"]` only -- never given a fallback
+value, and never written to a file. If the secret isn't set, the
+publish step logs that and exits `0` without touching the network; it
+never fails the workflow on that basis alone.
+
+Guarded the same way as the Enabler step: only runs on this repo's own
+`schedule` trigger (`github.repository == 'cyntra360hub/backup-audit'`),
+never on a fork and never on a manual `workflow_dispatch`.
+
+Try it locally without publishing anything:
+
+```bash
+AIOPS_COMMUNITY_KEY=placeholder python -m backup_audit.aiops_community --dry-run
+```
+
 ## Development
 
 ```bash
