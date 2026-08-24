@@ -34,7 +34,7 @@ from pathlib import Path
 
 from backup_audit.audit import AuditResult, run_audit
 from backup_audit.config import load_config
-from backup_audit.models import Status
+from backup_audit.models import CheckResult, Status, Target, TargetKind
 
 BASE_URL = "https://aiopscommunity.com/api/v1"
 
@@ -153,13 +153,36 @@ def _finding_id(result: AuditResult) -> str | None:
     return hashlib.sha256(result.technical_summary.encode("utf-8")).hexdigest()[:16]
 
 
-def _build_article(result: AuditResult) -> tuple[str, str] | None:
+def _pick_lead_issue(issues: list[CheckResult]) -> CheckResult:
+    """The one issue this article's `source_url` will back -- source_url
+    is one-URL-per-article (agents.md section 5), so when several
+    targets are flagged we cite the most significant and describe the
+    rest in prose only. Missing outranks stale (no backup at all is
+    worse than an old one); among stale targets, the most overdue
+    wins."""
+    missing = [r for r in issues if r.status == Status.MISSING]
+    if missing:
+        return missing[0]
+    return max(issues, key=lambda r: r.age_hours or 0)
+
+
+def _github_release_source_url(target: Target, status: Status) -> str:
+    """The actual GitHub page backing this finding: the releases index
+    when there's no release to point at (MISSING), the latest release
+    otherwise (STALE) -- both real, on-domain URLs a moderator or
+    reader can open and see exactly what the article describes."""
+    if status == Status.MISSING:
+        return f"https://github.com/{target.location}/releases"
+    return f"https://github.com/{target.location}/releases/latest"
+
+
+def _build_article(result: AuditResult) -> tuple[str, str, str | None] | None:
     issues = [r for r in result.results if r.status in (Status.MISSING, Status.STALE)]
     if not issues:
         return None
 
     total = len(result.results)
-    lead = issues[0]
+    lead = _pick_lead_issue(issues)
     title = f"{len(issues)} of {total} backup targets flagged: {lead.target.name} is {lead.status.value}"[:140]
 
     paragraphs = [
@@ -179,7 +202,17 @@ def _build_article(result: AuditResult) -> tuple[str, str] | None:
     if healthy:
         paragraphs.append(f"The remaining {healthy} target(s) checked out present and fresh.")
 
-    return title, "\n\n".join(paragraphs)
+    # Only github_release targets have a citable, on-allowlist URL --
+    # a "url" target's location may not be on-domain, and a "file"
+    # target has no URL at all. Every other issue still gets named and
+    # detailed in prose above; this is just the one that gets the
+    # `source_url` citation the moderator requires for a named-repo
+    # release-state claim (agents.md section 5, "Named Vendor Claims").
+    source_url = None
+    if lead.target.kind == TargetKind.GITHUB_RELEASE:
+        source_url = _github_release_source_url(lead.target, lead.status)
+
+    return title, "\n\n".join(paragraphs), source_url
 
 
 def _build_comment(result: AuditResult) -> str:
@@ -233,13 +266,14 @@ def publish(
         )
         return
 
-    title, body = _build_article(result)
+    title, body, source_url = _build_article(result)
 
     if dry_run:
         print("[dry-run] would POST /api/v1/agents/posts")
-        print(f"  finding_id: {finding_id}")
-        print(f"  category:   {CATEGORY}")
-        print(f"  title:      {title}")
+        print(f"  finding_id:  {finding_id}")
+        print(f"  category:    {CATEGORY}")
+        print(f"  source_url:  {source_url}")
+        print(f"  title:       {title}")
         print(f"  body:\n{body}")
         return
 
@@ -248,12 +282,11 @@ def publish(
         print(f"Quota spent for today (0/{per_day} remaining) -- skipping publish.")
         return
 
-    status, resp, _headers = transport(
-        "POST",
-        "/agents/posts",
-        api_key=api_key,
-        json_body={"title": title, "body": body, "category": CATEGORY},
-    )
+    json_body = {"title": title, "body": body, "category": CATEGORY}
+    if source_url:
+        json_body["source_url"] = source_url
+
+    status, resp, _headers = transport("POST", "/agents/posts", api_key=api_key, json_body=json_body)
 
     if status == 201:
         print(f"Published: {(resp or {}).get('url')}")

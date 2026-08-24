@@ -68,12 +68,36 @@ def test_build_article_none_when_healthy():
 
 
 def test_build_article_has_real_numbers():
-    title, body = aiops._build_article(_material_result())
+    title, body, source_url = aiops._build_article(_material_result())
     assert 10 <= len(title) <= 140
     assert "missing-one" in title or "missing-one" in body
     assert "999.5 hours old" in body
     assert "no releases published" in body
     assert len(body) >= 200
+    assert "https://github.com/o/r/releases" not in body  # never in body -- would be stripped anyway
+
+
+def test_build_article_source_url_prefers_missing_over_stale():
+    # Missing outranks stale for the single-URL-per-article citation
+    # (agents.md source_url is one URL only) -- a missing backup is a
+    # worse finding than a stale one, so it's the one cited.
+    _, _, source_url = aiops._build_article(_material_result())
+    assert source_url == "https://github.com/o/r/releases"
+
+
+def test_build_article_source_url_is_latest_release_when_only_stale():
+    result = AuditResult(
+        results=(CheckResult(_target("stale-one", ), Status.STALE, "release v1", age_hours=999.5),)
+    )
+    _, _, source_url = aiops._build_article(result)
+    assert source_url == "https://github.com/o/r/releases/latest"
+
+
+def test_build_article_source_url_none_for_non_github_targets():
+    file_target = Target(name="local", kind=TargetKind.FILE, location="/backups/x.tar.gz", freshness_hours=24)
+    result = AuditResult(results=(CheckResult(file_target, Status.MISSING, "file does not exist"),))
+    _, _, source_url = aiops._build_article(result)
+    assert source_url is None
 
 
 def test_build_comment_has_counts():
@@ -123,6 +147,23 @@ def test_publish_success_records_state():
     finding_id = aiops._finding_id(_material_result())
     assert finding_id in state["published"]
     assert aiops.load_state()["published"] == [finding_id]
+
+    post_call = transport.calls[-1]
+    assert post_call["json_body"]["source_url"] == "https://github.com/o/r/releases"
+
+
+def test_publish_omits_source_url_when_not_applicable():
+    file_target = Target(name="local", kind=TargetKind.FILE, location="/backups/x.tar.gz", freshness_hours=24)
+    result = AuditResult(results=(CheckResult(file_target, Status.MISSING, "file does not exist"),))
+    transport = FakeTransport(
+        [
+            (200, {"posts_per_day": 2, "posts_used_today": 0}, {}),
+            (201, {"url": "https://aiopscommunity.com/posts/x"}, {}),
+        ]
+    )
+    aiops.publish(result, "key", aiops.load_state(), transport=transport)
+    post_call = transport.calls[-1]
+    assert "source_url" not in post_call["json_body"]
 
 
 def test_publish_skips_when_already_published():
