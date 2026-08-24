@@ -1,3 +1,4 @@
+import urllib.error
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -43,6 +44,49 @@ class FakeTransport:
         return self._responses.pop(0)
 
 
+class _FakeHTTPErrorBody:
+    def __init__(self, data: bytes):
+        self._data = data
+
+    def read(self):
+        return self._data
+
+    def close(self):
+        pass
+
+
+# ------------------------------------------------------------------
+# http_request() -- the real transport
+# ------------------------------------------------------------------
+
+
+def test_http_request_returns_json_error_body(monkeypatch):
+    def fake_urlopen(request, timeout):
+        raise urllib.error.HTTPError(
+            request.full_url, 422, "Unprocessable", {}, _FakeHTTPErrorBody(b'{"reason": "too_vague"}')
+        )
+
+    monkeypatch.setattr(aiops.urllib.request, "urlopen", fake_urlopen)
+    status, body, _ = aiops.http_request("POST", "/agents/posts", api_key="k", json_body={"a": 1})
+    assert status == 422
+    assert body == {"reason": "too_vague"}
+
+
+def test_http_request_preserves_raw_body_when_not_json(monkeypatch):
+    # This is the exact gap that made the 2026-08-24 503s undiagnosable
+    # from our own logs: a non-JSON error body used to be silently
+    # discarded as None instead of surfaced.
+    def fake_urlopen(request, timeout):
+        raise urllib.error.HTTPError(
+            request.full_url, 503, "Service Unavailable", {}, _FakeHTTPErrorBody(b"<html>upstream down</html>")
+        )
+
+    monkeypatch.setattr(aiops.urllib.request, "urlopen", fake_urlopen)
+    status, body, _ = aiops.http_request("POST", "/agents/posts", api_key="k", json_body={"a": 1})
+    assert status == 503
+    assert body == {"_raw_body": "<html>upstream down</html>"}
+
+
 # ------------------------------------------------------------------
 # Building finding text
 # ------------------------------------------------------------------
@@ -80,17 +124,41 @@ def test_build_article_has_real_numbers():
 def test_build_article_source_url_prefers_missing_over_stale():
     # Missing outranks stale for the single-URL-per-article citation
     # (agents.md source_url is one URL only) -- a missing backup is a
-    # worse finding than a stale one, so it's the one cited.
+    # worse finding than a stale one, so it's the one cited. Neither
+    # CheckResult in _material_result() carries a release_url, so this
+    # also exercises the no-release-object fallback.
     _, _, source_url = aiops._build_article(_material_result())
     assert source_url == "https://github.com/o/r/releases"
 
 
-def test_build_article_source_url_is_latest_release_when_only_stale():
+def test_build_article_source_url_uses_release_url_directly():
+    # The normal case: checkers.py already captured the release's own
+    # html_url (a direct .../releases/tag/{tag} page, never a redirect)
+    # -- use it as-is rather than constructing anything.
     result = AuditResult(
-        results=(CheckResult(_target("stale-one", ), Status.STALE, "release v1", age_hours=999.5),)
+        results=(
+            CheckResult(
+                _target("stale-one"),
+                Status.STALE,
+                "release v1",
+                age_hours=999.5,
+                release_url="https://github.com/o/r/releases/tag/v1.0.0",
+            ),
+        )
     )
     _, _, source_url = aiops._build_article(result)
-    assert source_url == "https://github.com/o/r/releases/latest"
+    assert source_url == "https://github.com/o/r/releases/tag/v1.0.0"
+
+
+def test_build_article_source_url_falls_back_when_no_release_object():
+    # A true "no releases published" 404 -- no release object, so no
+    # html_url to capture. The plain releases index is still a direct
+    # 200 (verified against github.com), not a redirect.
+    result = AuditResult(
+        results=(CheckResult(_target("stale-one"), Status.STALE, "release v1", age_hours=999.5),)
+    )
+    _, _, source_url = aiops._build_article(result)
+    assert source_url == "https://github.com/o/r/releases"
 
 
 def test_build_article_source_url_none_for_non_github_targets():
@@ -212,6 +280,22 @@ def test_publish_503_does_not_record_anything():
     aiops.publish(_material_result(), "key", state, transport=transport)
     assert state["published"] == []
     assert state["rejected"] == {}
+
+
+def test_publish_logs_full_response_body_on_any_non_201(capsys):
+    # Added after the 2026-08-24 outage: the code used to print a fixed
+    # message on 503 with no visibility into the actual response body.
+    # Whatever the transport returns must now show up in the output.
+    transport = FakeTransport(
+        [
+            (200, {"posts_per_day": 2, "posts_used_today": 0}, {}),
+            (503, {"_raw_body": "<html>upstream error</html>"}, {}),
+        ]
+    )
+    aiops.publish(_material_result(), "key", aiops.load_state(), transport=transport)
+    out = capsys.readouterr().out
+    assert "503" in out
+    assert "upstream error" in out
 
 
 # ------------------------------------------------------------------

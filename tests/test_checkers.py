@@ -15,6 +15,7 @@ def _release_payload(published_at: datetime, assets: list | None = None) -> str:
     return json.dumps(
         {
             "tag_name": "v1.0.0",
+            "html_url": "https://github.com/o/r/releases/tag/v1.0.0",
             "published_at": published_at.isoformat().replace("+00:00", "Z"),
             "assets": assets if assets is not None else [{"name": "checksums.txt"}],
         }
@@ -27,6 +28,7 @@ def test_github_release_fresh():
     result = check_github_release(target, now=NOW, fetcher=fetcher)
     assert result.status == Status.OK
     assert result.age_hours == 10.0
+    assert result.release_url == "https://github.com/o/r/releases/tag/v1.0.0"
 
 
 def test_github_release_stale():
@@ -34,6 +36,7 @@ def test_github_release_stale():
     fetcher = lambda url, timeout: _release_payload(NOW - timedelta(hours=100))
     result = check_github_release(target, now=NOW, fetcher=fetcher)
     assert result.status == Status.STALE
+    assert result.release_url == "https://github.com/o/r/releases/tag/v1.0.0"
 
 
 def test_github_release_no_assets_is_missing():
@@ -41,6 +44,9 @@ def test_github_release_no_assets_is_missing():
     fetcher = lambda url, timeout: _release_payload(NOW, assets=[])
     result = check_github_release(target, now=NOW, fetcher=fetcher)
     assert result.status == Status.MISSING
+    # A release object exists (it just has no assets) -- its html_url
+    # is still a real, direct, non-redirecting page worth citing.
+    assert result.release_url == "https://github.com/o/r/releases/tag/v1.0.0"
 
 
 def test_github_release_404_is_missing():
@@ -53,6 +59,7 @@ def test_github_release_404_is_missing():
 
     result = check_github_release(target, now=NOW, fetcher=fetcher)
     assert result.status == Status.MISSING
+    assert result.release_url is None  # no release object exists to link to
 
 
 def test_github_release_other_http_error_is_error():

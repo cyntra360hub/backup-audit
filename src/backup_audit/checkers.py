@@ -73,16 +73,20 @@ def check_github_release(
         return CheckResult(target, Status.ERROR, str(exc))
 
     release = json.loads(raw)
+    release_url = release.get("html_url")
     if not release.get("assets"):
         return CheckResult(
-            target, Status.MISSING, f"release {release.get('tag_name')} has no assets"
+            target,
+            Status.MISSING,
+            f"release {release.get('tag_name')} has no assets",
+            release_url=release_url,
         )
 
     published_at = datetime.fromisoformat(release["published_at"].replace("Z", "+00:00"))
     age_hours = (now - published_at).total_seconds() / 3600
     status = _age_status(age_hours, target.freshness_hours)
     detail = f"release {release.get('tag_name')}, {len(release['assets'])} asset(s)"
-    return CheckResult(target, status, detail, age_hours=age_hours)
+    return CheckResult(target, status, detail, age_hours=age_hours, release_url=release_url)
 
 
 def check_url(

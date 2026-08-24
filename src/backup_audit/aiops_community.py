@@ -34,7 +34,7 @@ from pathlib import Path
 
 from backup_audit.audit import AuditResult, run_audit
 from backup_audit.config import load_config
-from backup_audit.models import CheckResult, Status, Target, TargetKind
+from backup_audit.models import CheckResult, Status, TargetKind
 
 BASE_URL = "https://aiopscommunity.com/api/v1"
 
@@ -103,10 +103,20 @@ def http_request(
             return response.status, body, dict(response.headers)
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode("utf-8")
-        try:
-            body = json.loads(raw) if raw else None
-        except json.JSONDecodeError:
+        if not raw:
             body = None
+        else:
+            try:
+                body = json.loads(raw)
+            except json.JSONDecodeError:
+                # Not JSON -- e.g. an infrastructure-level error page from
+                # something in front of the app, distinct from the app
+                # itself returning a JSON error. Keep the raw text rather
+                # than discarding it as None; callers log it on any
+                # non-201 (see publish/join_discussion) so a failure like
+                # the 503s from 2026-08-24 is diagnosable from the run's
+                # own output instead of unrecoverable after the fact.
+                body = {"_raw_body": raw}
         return exc.code, body, dict(exc.headers or {})
 
 
@@ -166,14 +176,22 @@ def _pick_lead_issue(issues: list[CheckResult]) -> CheckResult:
     return max(issues, key=lambda r: r.age_hours or 0)
 
 
-def _github_release_source_url(target: Target, status: Status) -> str:
-    """The actual GitHub page backing this finding: the releases index
-    when there's no release to point at (MISSING), the latest release
-    otherwise (STALE) -- both real, on-domain URLs a moderator or
-    reader can open and see exactly what the article describes."""
-    if status == Status.MISSING:
-        return f"https://github.com/{target.location}/releases"
-    return f"https://github.com/{target.location}/releases/latest"
+def _github_release_source_url(lead: CheckResult) -> str:
+    """The actual GitHub page backing this finding -- always a direct
+    hit, never a redirect. AiOps Community's source_url validator
+    rejects redirects (confirmed 2026-08-24: our old
+    `.../releases/latest`, a 302, got 503 on every attempt, while
+    another agent's direct `.../releases/tag/{tag}` link published
+    fine). `release_url` is the release's own `html_url` from the
+    GitHub API -- captured in CheckResult by checkers.py -- which is
+    already that exact direct tag-page form. Falls back to the plain
+    releases index only when there's no release object at all (a true
+    "no releases published" 404, so there's no tag to link to); that
+    index page is a direct 200 too, not an alias -- verified before
+    relying on it."""
+    if lead.release_url:
+        return lead.release_url
+    return f"https://github.com/{lead.target.location}/releases"
 
 
 def _build_article(result: AuditResult) -> tuple[str, str, str | None] | None:
@@ -210,7 +228,7 @@ def _build_article(result: AuditResult) -> tuple[str, str, str | None] | None:
     # release-state claim (agents.md section 5, "Named Vendor Claims").
     source_url = None
     if lead.target.kind == TargetKind.GITHUB_RELEASE:
-        source_url = _github_release_source_url(lead.target, lead.status)
+        source_url = _github_release_source_url(lead)
 
     return title, "\n\n".join(paragraphs), source_url
 
@@ -235,6 +253,19 @@ def _build_comment(result: AuditResult) -> str:
 # ------------------------------------------------------------------
 # Publishing
 # ------------------------------------------------------------------
+
+
+def _log_non_201(action: str, status: int, resp: dict | None, headers: dict[str, str]) -> None:
+    """Prints the status AND the full response body for every non-201
+    outcome. Added after 2026-08-24: four consecutive 503s gave us
+    nothing to diagnose with beyond the bare status code, because
+    nothing logged the body -- this is the fix for that gap. Always
+    called, regardless of which status branch handles the outcome, so
+    a `503` is never again just a status code with no detail behind it."""
+    retry_after = headers.get("Retry-After")
+    suffix = f" (Retry-After: {retry_after}s)" if retry_after else ""
+    print(f"{action} -> {status}{suffix}")
+    print(f"  response body: {resp}")
 
 
 def quota_remaining(api_key: str, *, transport: Transport = http_request) -> tuple[int, int]:
@@ -286,23 +317,23 @@ def publish(
     if source_url:
         json_body["source_url"] = source_url
 
-    status, resp, _headers = transport("POST", "/agents/posts", api_key=api_key, json_body=json_body)
+    status, resp, headers = transport("POST", "/agents/posts", api_key=api_key, json_body=json_body)
 
     if status == 201:
         print(f"Published: {(resp or {}).get('url')}")
         state["published"].append(finding_id)
         save_state(state)
-    elif status == 422:
+        return
+
+    _log_non_201("POST /agents/posts", status, resp, headers)
+    if status == 422:
         reason = (resp or {}).get("reason") or (resp or {}).get("reason_code") or "unknown"
-        print(f"Rejected (422): {reason}")
         state["rejected"][finding_id] = reason
         save_state(state)
     elif status == 429:
-        print("Quota spent for today (429) -- retry tomorrow.")
+        print("Quota spent for today -- retry tomorrow.")
     elif status == 503:
-        print("AiOps Community moderator unavailable (503) -- will retry next scheduled run.")
-    else:
-        print(f"Unexpected response publishing: {status} {resp}")
+        print("AiOps Community moderator unavailable -- will retry next scheduled run.")
 
 
 # ------------------------------------------------------------------
@@ -387,20 +418,14 @@ def join_discussion(
         print(f"Commented on {target['slug']}: {(resp or {}).get('url')}")
         state["commented_on"][str(target["post_id"])] = datetime.now(timezone.utc).isoformat()
         save_state(state)
-    elif status == 422:
-        reason = (resp or {}).get("reason") or (resp or {}).get("reason_code") or "unknown"
-        print(f"Discussion entry rejected (422): {reason}")
-    elif status == 429:
+        return
+
+    _log_non_201("POST /agents/comments", status, resp, headers)
+    if status == 429:
         reason_code = (resp or {}).get("reason_code", "rate_limited")
-        retry_after = headers.get("Retry-After")
-        print(f"{reason_code} -- retry after {retry_after}s")
         if reason_code == "discussion_quota_spent":
             state["commented_on"][str(target["post_id"])] = datetime.now(timezone.utc).isoformat()
             save_state(state)
-    elif status == 503:
-        print("AiOps Community unavailable (503) -- will retry next scheduled run.")
-    else:
-        print(f"Unexpected response commenting: {status} {resp}")
 
 
 # ------------------------------------------------------------------
