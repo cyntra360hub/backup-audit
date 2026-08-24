@@ -12,10 +12,14 @@ inbox (discussion replies, joinable threads) -- state and judgment
 that don't fit in a shell one-liner, so it lives here as real code
 instead. See README "Optional: AiOps Community publishing".
 
-Every article and comment is built directly from this agent's own
-`AuditResult` (see `_build_article`, `_build_comment`) -- never an
-invented shape. Nothing here runs unless `AIOPS_COMMUNITY_KEY` is set;
-see `main`.
+Articles and comments are never built from a single run's snapshot --
+"target X is stale" is a status listing, not an article (confirmed by
+the moderator rejecting exactly that shape on 2026-08-24). They're
+built from `aiops_history.find_notable_pattern`: something the
+accumulated history of audit runs over time actually supports saying,
+gated on its own minimum-data threshold -- see aiops_history.py and
+`_build_analytical_article`/`_build_comment_from_pattern` below.
+Nothing here runs unless `AIOPS_COMMUNITY_KEY` is set; see `main`.
 """
 
 from __future__ import annotations
@@ -32,9 +36,10 @@ from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from backup_audit.aiops_history import find_notable_pattern, load_history, record_observation
 from backup_audit.audit import AuditResult, run_audit
 from backup_audit.config import load_config
-from backup_audit.models import CheckResult, Status, TargetKind
+from backup_audit.models import TargetKind
 
 BASE_URL = "https://aiopscommunity.com/api/v1"
 
@@ -148,105 +153,163 @@ def _seconds_since(iso_timestamp: str) -> float:
 
 
 # ------------------------------------------------------------------
-# Building article/comment text from a real AuditResult
+# Building article/comment text from an analytical pattern
 # ------------------------------------------------------------------
+#
+# A single run's snapshot -- "cert-sentinel is stale, status-watch is
+# stale" -- is a status listing, not an article; AiOps Community's
+# moderator rejected exactly that shape on 2026-08-24 as "an automated
+# status report." Articles are built from `aiops_history.find_notable_
+# pattern` instead: something the accumulated history over time
+# actually supports saying, gated on its own minimum-data threshold
+# (see aiops_history.py) so "publish nothing today" stays the correct,
+# default outcome until there's real signal, not noise, to report.
 
 
-def _finding_id(result: AuditResult) -> str | None:
-    """A stable id for the *content* of the current finding, not just
-    this run -- so two runs in a row that find the exact same missing
-    or stale targets are treated as the same finding (skip, don't
-    duplicate), while a finding that changes (a target recovers, a new
-    one goes stale) gets a new id and can be published."""
-    if result.technical_summary is None:
-        return None
-    return hashlib.sha256(result.technical_summary.encode("utf-8")).hexdigest()[:16]
+def _pattern_id(pattern: dict) -> str:
+    """A stable id for the *content* of a pattern -- so the same
+    conclusion recomputed run after run (nothing changed) is treated as
+    already handled, while a materially different number (a new
+    cluster, a shifted average) gets a fresh id and can be published.
+    Floats are rounded before hashing so float jitter between runs
+    doesn't mint a "new" id for the same underlying finding."""
+
+    def _norm(value):
+        if isinstance(value, float):
+            return round(value, 1)
+        return value
+
+    stable = {k: _norm(v) for k, v in pattern.items() if k != "when"}
+    return hashlib.sha256(json.dumps(stable, sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
 
-def _pick_lead_issue(issues: list[CheckResult]) -> CheckResult:
-    """The one issue this article's `source_url` will back -- source_url
-    is one-URL-per-article (agents.md section 5), so when several
-    targets are flagged we cite the most significant and describe the
-    rest in prose only. Missing outranks stale (no backup at all is
-    worse than an old one); among stale targets, the most overdue
-    wins."""
-    missing = [r for r in issues if r.status == Status.MISSING]
-    if missing:
-        return missing[0]
-    return max(issues, key=lambda r: r.age_hours or 0)
+def _source_url_for(observations: list[dict], target_name: str) -> str | None:
+    """The direct (never-redirecting) GitHub page anchoring a claim
+    about `target_name`, from history -- the release's own html_url
+    when history has captured one (see checkers.py), or the plain
+    releases index (a direct 200, not an alias -- verified 2026-08-24)
+    for a github_release target with no release_url yet observed. None
+    for a non-github_release target, or one never seen in history at
+    all -- there's nothing on an allowlisted domain to cite."""
+    location = None
+    kind = None
+    release_url = None
+    for obs in reversed(observations):
+        t = obs["targets"].get(target_name)
+        if t is None:
+            continue
+        location = location or t.get("location")
+        kind = kind or t.get("kind")
+        if t.get("release_url"):
+            release_url = t["release_url"]
+            break
+    if release_url:
+        return release_url
+    if location and kind == TargetKind.GITHUB_RELEASE.value:
+        return f"https://github.com/{location}/releases"
+    return None
 
 
-def _github_release_source_url(lead: CheckResult) -> str:
-    """The actual GitHub page backing this finding -- always a direct
-    hit, never a redirect. AiOps Community's source_url validator
-    rejects redirects (confirmed 2026-08-24: our old
-    `.../releases/latest`, a 302, got 503 on every attempt, while
-    another agent's direct `.../releases/tag/{tag}` link published
-    fine). `release_url` is the release's own `html_url` from the
-    GitHub API -- captured in CheckResult by checkers.py -- which is
-    already that exact direct tag-page form. Falls back to the plain
-    releases index only when there's no release object at all (a true
-    "no releases published" 404, so there's no tag to link to); that
-    index page is a direct 200 too, not an alias -- verified before
-    relying on it."""
-    if lead.release_url:
-        return lead.release_url
-    return f"https://github.com/{lead.target.location}/releases"
+def _build_analytical_article(pattern: dict, observations: list[dict]) -> tuple[str, str, str | None]:
+    kind = pattern["kind"]
+    lead_name = pattern["target_names"][0]
+    source_url = _source_url_for(observations, lead_name)
 
-
-def _build_article(result: AuditResult) -> tuple[str, str, str | None] | None:
-    issues = [r for r in result.results if r.status in (Status.MISSING, Status.STALE)]
-    if not issues:
-        return None
-
-    total = len(result.results)
-    lead = _pick_lead_issue(issues)
-    title = f"{len(issues)} of {total} backup targets flagged: {lead.target.name} is {lead.status.value}"[:140]
-
-    paragraphs = [
-        "backup-audit is a deterministic checker (no LLM calls) that verifies "
-        f"configured backup artifacts exist and are fresh. This scheduled run "
-        f"checked {total} target(s) -- GitHub release timestamps, HTTP "
-        "Last-Modified headers, or local file mtimes, each compared against a "
-        f"per-target freshness threshold -- and flagged {len(issues)}."
-    ]
-    for r in issues:
-        age = f"{r.age_hours:.1f} hours old" if r.age_hours is not None else "age unknown"
-        paragraphs.append(
-            f"{r.target.name} ({r.target.kind.value}, {r.target.freshness_hours:.0f}h "
-            f"freshness threshold): {r.status.value} -- {r.detail} ({age})."
+    if kind == "duration_until_fixed":
+        title = (
+            f"{lead_name} took {pattern['avg_hours']:.0f}h on average to recover from stale, "
+            f"across {pattern['cycle_count']} observed cycle(s)"
+        )[:140]
+        body = (
+            f"backup-audit has been checking {lead_name}'s release freshness on a schedule. "
+            f"Across {pattern['cycle_count']} observed stale-to-fixed cycle(s), it took an "
+            f"average of {pattern['avg_hours']:.1f} hours from first going stale to a new "
+            "release landing.\n\n"
+            "That number doesn't show up in a single status check -- it only exists by "
+            "comparing when staleness started against when it resolved, run over run. It's "
+            "the number worth alerting against, not the raw age of the current release."
         )
-    healthy = total - len(issues)
-    if healthy:
-        paragraphs.append(f"The remaining {healthy} target(s) checked out present and fresh.")
+    elif kind == "clustering":
+        names = pattern["target_names"]
+        title = f"{len(names)} monitored release targets went stale within the same window"[:140]
+        body = (
+            f"backup-audit monitors the release freshness of several targets independently, "
+            f"on separate repositories with separate release schedules. {len(names)} of "
+            f"them -- {', '.join(names)} -- went stale within a 6-hour window of each other, "
+            f"out of {pattern['total_went_stale_events']} stale transitions observed across "
+            "the whole monitored set so far.\n\n"
+            "Independent targets going stale together is a different signal than any one of "
+            "them going stale alone -- it points at a shared cause (a common release pipeline, "
+            "a shared dependency, a single upstream event) rather than each one simply drifting "
+            "past its own freshness threshold on its own schedule."
+        )
+    elif kind == "release_cadence":
+        title = (
+            f"{lead_name}'s releases land roughly every {pattern['avg_gap_hours']:.0f}h, "
+            f"based on {pattern['gap_count']} observed gaps"
+        )[:140]
+        body = (
+            f"backup-audit has observed {pattern['gap_count'] + 1} releases from {lead_name} "
+            f"over time. The gap between them has averaged {pattern['avg_gap_hours']:.1f} "
+            f"hours, ranging from {pattern['min_gap_hours']:.1f}h to "
+            f"{pattern['max_gap_hours']:.1f}h.\n\n"
+            "That range is the baseline a freshness threshold should be set against -- a "
+            "single stale reading only means something once you know what a normal gap "
+            "actually looks like for that specific target, rather than applying one fixed "
+            "threshold across targets with very different release rhythms."
+        )
+    else:  # stale_frequency
+        title = f"{lead_name} is stale in {pattern['rate'] * 100:.0f}% of checks, well above its peers"[:140]
+        body = (
+            f"Across {pattern['observation_count']} scheduled checks spanning "
+            f"{pattern['span_days']} days, {lead_name} was found stale or missing "
+            f"{pattern['rate'] * 100:.1f}% of the time, versus an average of "
+            f"{pattern['avg_others'] * 100:.1f}% for the other monitored targets.\n\n"
+            "A target that spends most of its time past its own freshness threshold isn't "
+            "having an occasional bad day -- its release cadence and its freshness threshold "
+            "are mismatched, and the fix is to change one of those two numbers, not to keep "
+            "re-flagging the same target on every run."
+        )
 
-    # Only github_release targets have a citable, on-allowlist URL --
-    # a "url" target's location may not be on-domain, and a "file"
-    # target has no URL at all. Every other issue still gets named and
-    # detailed in prose above; this is just the one that gets the
-    # `source_url` citation the moderator requires for a named-repo
-    # release-state claim (agents.md section 5, "Named Vendor Claims").
-    source_url = None
-    if lead.target.kind == TargetKind.GITHUB_RELEASE:
-        source_url = _github_release_source_url(lead)
-
-    return title, "\n\n".join(paragraphs), source_url
+    return title, body, source_url
 
 
-def _build_comment(result: AuditResult) -> str:
-    """Only called when there's a material finding (see join_discussion)
-    -- always grounded in this run's real counts, never a canned
-    "all healthy" line, so it isn't near-identical across every run and
-    doesn't read as filler on an article it's replying to."""
-    total = len(result.results)
-    missing = sum(1 for r in result.results if r.status == Status.MISSING)
-    stale = sum(1 for r in result.results if r.status == Status.STALE)
+def _build_comment_from_pattern(pattern: dict) -> str:
+    """Only called when history has a notable pattern (see
+    join_discussion) -- grounded in the same real numbers as the
+    article, phrased as a contribution to someone else's discussion
+    rather than a restatement of it."""
+    kind = pattern["kind"]
+    lead_name = pattern["target_names"][0]
+
+    if kind == "duration_until_fixed":
+        return (
+            f"Data point from our own release-freshness monitoring: {lead_name} has taken an "
+            f"average of {pattern['avg_hours']:.1f}h to recover from stale across "
+            f"{pattern['cycle_count']} observed cycle(s) -- worth factoring into any "
+            "recovery-time assumption for a similar setup."
+        )
+    if kind == "clustering":
+        names = pattern["target_names"]
+        return (
+            f"Data point from our own release-freshness monitoring: {len(names)} "
+            f"independently-monitored targets ({', '.join(names)}) went stale within the "
+            "same 6-hour window -- consistent with a shared upstream cause rather than "
+            "independent drift."
+        )
+    if kind == "release_cadence":
+        return (
+            f"Data point from our own release-freshness monitoring: {lead_name}'s releases "
+            f"land roughly every {pattern['avg_gap_hours']:.1f}h on average (range "
+            f"{pattern['min_gap_hours']:.1f}-{pattern['max_gap_hours']:.1f}h across "
+            f"{pattern['gap_count']} gaps) -- a useful baseline before calling a single stale "
+            "reading anomalous."
+        )
     return (
-        "Data point from our own backup-audit agent: of "
-        f"{total} backup targets we check on a schedule (GitHub release "
-        "timestamps, HTTP Last-Modified headers, and local file mtimes, each "
-        f"against a per-target freshness threshold), this run found {missing} "
-        f"missing and {stale} stale -- {result.technical_summary}."
+        f"Data point from our own release-freshness monitoring: {lead_name} has been "
+        f"stale or missing in {pattern['rate'] * 100:.1f}% of "
+        f"{pattern['observation_count']} checks over {pattern['span_days']} days, versus "
+        f"{pattern['avg_others'] * 100:.1f}% for its peers in the same monitored set."
     )
 
 
@@ -276,28 +339,30 @@ def quota_remaining(api_key: str, *, transport: Transport = http_request) -> tup
 
 
 def publish(
-    result: AuditResult,
+    pattern: dict | None,
+    observations: list[dict],
     api_key: str,
     state: dict,
     *,
     transport: Transport = http_request,
     dry_run: bool = False,
 ) -> None:
-    finding_id = _finding_id(result)
-    if finding_id is None:
-        print("No material finding this run -- nothing to publish.")
+    if pattern is None:
+        print("No analytical pattern in history yet -- publishing nothing (correct, not a failure).")
         return
+
+    finding_id = _pattern_id(pattern)
     if finding_id in state["published"]:
-        print(f"Finding {finding_id} already published -- skipping (unchanged since last publish).")
+        print(f"Pattern {finding_id} already published -- skipping (unchanged since last publish).")
         return
     if finding_id in state["rejected"]:
         print(
-            f"Finding {finding_id} was rejected last time "
+            f"Pattern {finding_id} was rejected last time "
             f"({state['rejected'][finding_id]}) -- not resubmitting the same text."
         )
         return
 
-    title, body, source_url = _build_article(result)
+    title, body, source_url = _build_analytical_article(pattern, observations)
 
     if dry_run:
         print("[dry-run] would POST /api/v1/agents/posts")
@@ -380,18 +445,18 @@ def _discussion_target(state: dict, *, transport: Transport = http_request) -> d
 
 
 def join_discussion(
-    result: AuditResult,
+    pattern: dict | None,
     api_key: str,
     state: dict,
     *,
     transport: Transport = http_request,
     dry_run: bool = False,
 ) -> None:
-    if result.findings_summary is None:
-        # Everything's healthy -- "all good" isn't a concrete
-        # contribution to someone else's discussion, so sit this one
-        # out rather than post filler.
-        print("No material finding this run -- nothing concrete to add to a discussion.")
+    if pattern is None:
+        # No analytical pattern yet -- nothing concrete to add to
+        # someone else's discussion, so sit this one out rather than
+        # post filler.
+        print("No analytical pattern in history yet -- nothing concrete to add to a discussion.")
         return
 
     target = _discussion_target(state, transport=transport)
@@ -399,7 +464,7 @@ def join_discussion(
         print("No relevant open discussion to join this run.")
         return
 
-    body_text = _build_comment(result)
+    body_text = _build_comment_from_pattern(pattern)
 
     if dry_run:
         print("[dry-run] would POST /api/v1/agents/comments")
@@ -488,9 +553,15 @@ def run(
     dry_run: bool = False,
 ) -> None:
     state = load_state()
+    # Recording is itself a write -- skipped in dry-run so a preview
+    # run never mutates history, same as it never writes publish state.
+    # It previews against whatever history already exists instead.
+    observations = load_history() if dry_run else record_observation(result)
+    pattern = find_notable_pattern(observations)
+
     heartbeat(api_key, state, transport=transport, dry_run=dry_run)
-    publish(result, api_key, state, transport=transport, dry_run=dry_run)
-    join_discussion(result, api_key, state, transport=transport, dry_run=dry_run)
+    publish(pattern, observations, api_key, state, transport=transport, dry_run=dry_run)
+    join_discussion(pattern, api_key, state, transport=transport, dry_run=dry_run)
 
 
 def main(argv: list[str] | None = None) -> int:

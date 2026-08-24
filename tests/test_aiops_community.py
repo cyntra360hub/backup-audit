@@ -26,6 +26,29 @@ def _material_result() -> AuditResult:
     )
 
 
+def _observation(targets: dict, timestamp: str = "2026-08-01T00:00:00+00:00") -> dict:
+    return {"timestamp": timestamp, "targets": targets}
+
+
+def _stale_frequency_pattern(name: str = "cert-sentinel latest release") -> dict:
+    return {
+        "kind": "stale_frequency",
+        "target_names": [name],
+        "rate": 0.8,
+        "avg_others": 0.1,
+        "span_days": 40,
+        "observation_count": 100,
+    }
+
+
+def _observations_for(name: str, location: str = "o/r", release_url: str | None = "https://github.com/o/r/releases/tag/v1.0.0", kind: str = "github_release") -> list[dict]:
+    return [
+        _observation(
+            {name: {"status": "stale", "age_hours": 100.0, "release_url": release_url, "location": location, "kind": kind}}
+        )
+    ]
+
+
 @pytest.fixture(autouse=True)
 def _isolate_state(tmp_path, monkeypatch):
     monkeypatch.setattr(aiops, "STATE_FILE", tmp_path / "aiops_community.json")
@@ -88,89 +111,106 @@ def test_http_request_preserves_raw_body_when_not_json(monkeypatch):
 
 
 # ------------------------------------------------------------------
-# Building finding text
+# Building article/comment text from a pattern
 # ------------------------------------------------------------------
 
 
-def test_finding_id_none_when_healthy():
-    assert aiops._finding_id(_healthy_result()) is None
-
-
-def test_finding_id_stable_for_same_content():
-    a = aiops._finding_id(_material_result())
-    b = aiops._finding_id(_material_result())
+def test_pattern_id_stable_for_same_content():
+    a = aiops._pattern_id(_stale_frequency_pattern())
+    b = aiops._pattern_id(_stale_frequency_pattern())
     assert a == b
 
 
-def test_finding_id_changes_with_content():
-    other = AuditResult(results=(CheckResult(_target("different"), Status.MISSING, "no releases published"),))
-    assert aiops._finding_id(_material_result()) != aiops._finding_id(other)
+def test_pattern_id_changes_with_content():
+    a = aiops._pattern_id(_stale_frequency_pattern("cert-sentinel latest release"))
+    b = aiops._pattern_id(_stale_frequency_pattern("status-watch latest release"))
+    assert a != b
 
 
-def test_build_article_none_when_healthy():
-    assert aiops._build_article(_healthy_result()) is None
+def test_pattern_id_ignores_float_jitter():
+    p1 = _stale_frequency_pattern()
+    p2 = {**p1, "rate": p1["rate"] + 1e-9}
+    assert aiops._pattern_id(p1) == aiops._pattern_id(p2)
 
 
-def test_build_article_has_real_numbers():
-    title, body, source_url = aiops._build_article(_material_result())
+def test_source_url_uses_release_url_from_history():
+    observations = _observations_for("t", release_url="https://github.com/o/r/releases/tag/v1.0.0")
+    assert aiops._source_url_for(observations, "t") == "https://github.com/o/r/releases/tag/v1.0.0"
+
+
+def test_source_url_falls_back_to_releases_index_for_github_target():
+    observations = _observations_for("t", release_url=None)
+    assert aiops._source_url_for(observations, "t") == "https://github.com/o/r/releases"
+
+
+def test_source_url_none_for_non_github_target_with_no_release_url():
+    observations = _observations_for("t", release_url=None, kind="file")
+    assert aiops._source_url_for(observations, "t") is None
+
+
+def test_source_url_none_when_target_never_observed():
+    assert aiops._source_url_for([], "unseen") is None
+
+
+def test_build_analytical_article_stale_frequency():
+    pattern = _stale_frequency_pattern("cert-sentinel latest release")
+    observations = _observations_for("cert-sentinel latest release")
+    title, body, source_url = aiops._build_analytical_article(pattern, observations)
     assert 10 <= len(title) <= 140
-    assert "missing-one" in title or "missing-one" in body
-    assert "999.5 hours old" in body
-    assert "no releases published" in body
+    assert "cert-sentinel latest release" in title or "cert-sentinel latest release" in body
+    assert "80.0%" in body
+    assert "10.0%" in body
     assert len(body) >= 200
-    assert "https://github.com/o/r/releases" not in body  # never in body -- would be stripped anyway
-
-
-def test_build_article_source_url_prefers_missing_over_stale():
-    # Missing outranks stale for the single-URL-per-article citation
-    # (agents.md source_url is one URL only) -- a missing backup is a
-    # worse finding than a stale one, so it's the one cited. Neither
-    # CheckResult in _material_result() carries a release_url, so this
-    # also exercises the no-release-object fallback.
-    _, _, source_url = aiops._build_article(_material_result())
-    assert source_url == "https://github.com/o/r/releases"
-
-
-def test_build_article_source_url_uses_release_url_directly():
-    # The normal case: checkers.py already captured the release's own
-    # html_url (a direct .../releases/tag/{tag} page, never a redirect)
-    # -- use it as-is rather than constructing anything.
-    result = AuditResult(
-        results=(
-            CheckResult(
-                _target("stale-one"),
-                Status.STALE,
-                "release v1",
-                age_hours=999.5,
-                release_url="https://github.com/o/r/releases/tag/v1.0.0",
-            ),
-        )
-    )
-    _, _, source_url = aiops._build_article(result)
     assert source_url == "https://github.com/o/r/releases/tag/v1.0.0"
+    assert "https://github.com" not in body  # never in body -- would be stripped anyway
 
 
-def test_build_article_source_url_falls_back_when_no_release_object():
-    # A true "no releases published" 404 -- no release object, so no
-    # html_url to capture. The plain releases index is still a direct
-    # 200 (verified against github.com), not a redirect.
-    result = AuditResult(
-        results=(CheckResult(_target("stale-one"), Status.STALE, "release v1", age_hours=999.5),)
-    )
-    _, _, source_url = aiops._build_article(result)
-    assert source_url == "https://github.com/o/r/releases"
+def test_build_analytical_article_duration_until_fixed():
+    pattern = {
+        "kind": "duration_until_fixed",
+        "target_names": ["ci-triage latest release"],
+        "avg_hours": 12.5,
+        "cycle_count": 3,
+    }
+    title, body, _ = aiops._build_analytical_article(pattern, _observations_for("ci-triage latest release"))
+    assert "12" in title
+    assert "3" in body
+    assert len(body) >= 200
 
 
-def test_build_article_source_url_none_for_non_github_targets():
-    file_target = Target(name="local", kind=TargetKind.FILE, location="/backups/x.tar.gz", freshness_hours=24)
-    result = AuditResult(results=(CheckResult(file_target, Status.MISSING, "file does not exist"),))
-    _, _, source_url = aiops._build_article(result)
-    assert source_url is None
+def test_build_analytical_article_clustering_names_all_targets():
+    pattern = {
+        "kind": "clustering",
+        "target_names": ["a latest release", "b latest release"],
+        "when": "2026-08-01T00:00:00+00:00",
+        "cluster_size": 2,
+        "total_went_stale_events": 5,
+    }
+    title, body, _ = aiops._build_analytical_article(pattern, _observations_for("a latest release"))
+    assert "a latest release" in body
+    assert "b latest release" in body
+    assert len(body) >= 200
 
 
-def test_build_comment_has_counts():
-    comment = aiops._build_comment(_material_result())
-    assert "1 missing and 1 stale" in comment
+def test_build_analytical_article_release_cadence():
+    pattern = {
+        "kind": "release_cadence",
+        "target_names": ["status-watch latest release"],
+        "avg_gap_hours": 720.0,
+        "min_gap_hours": 700.0,
+        "max_gap_hours": 740.0,
+        "gap_count": 3,
+    }
+    title, body, _ = aiops._build_analytical_article(pattern, _observations_for("status-watch latest release"))
+    assert "status-watch latest release" in title or "status-watch latest release" in body
+    assert "700" in body and "740" in body
+    assert len(body) >= 200
+
+
+def test_build_comment_from_pattern_has_real_numbers():
+    comment = aiops._build_comment_from_pattern(_stale_frequency_pattern("cert-sentinel latest release"))
+    assert "cert-sentinel latest release" in comment
+    assert "80.0%" in comment
 
 
 # ------------------------------------------------------------------
@@ -191,19 +231,23 @@ def test_state_round_trip():
 # ------------------------------------------------------------------
 
 
-def test_publish_skips_when_no_finding():
+def test_publish_skips_when_no_pattern():
     transport = FakeTransport([])
-    aiops.publish(_healthy_result(), "key", aiops.load_state(), transport=transport)
+    aiops.publish(None, [], "key", aiops.load_state(), transport=transport)
     assert transport.calls == []
 
 
 def test_publish_dry_run_makes_no_calls():
+    pattern = _stale_frequency_pattern()
+    observations = _observations_for(pattern["target_names"][0])
     transport = FakeTransport([])
-    aiops.publish(_material_result(), "key", aiops.load_state(), transport=transport, dry_run=True)
+    aiops.publish(pattern, observations, "key", aiops.load_state(), transport=transport, dry_run=True)
     assert transport.calls == []
 
 
 def test_publish_success_records_state():
+    pattern = _stale_frequency_pattern()
+    observations = _observations_for(pattern["target_names"][0])
     transport = FakeTransport(
         [
             (200, {"posts_per_day": 2, "posts_used_today": 0}, {}),
@@ -211,38 +255,41 @@ def test_publish_success_records_state():
         ]
     )
     state = aiops.load_state()
-    aiops.publish(_material_result(), "key", state, transport=transport)
-    finding_id = aiops._finding_id(_material_result())
+    aiops.publish(pattern, observations, "key", state, transport=transport)
+    finding_id = aiops._pattern_id(pattern)
     assert finding_id in state["published"]
     assert aiops.load_state()["published"] == [finding_id]
 
     post_call = transport.calls[-1]
-    assert post_call["json_body"]["source_url"] == "https://github.com/o/r/releases"
+    assert post_call["json_body"]["source_url"] == "https://github.com/o/r/releases/tag/v1.0.0"
 
 
 def test_publish_omits_source_url_when_not_applicable():
-    file_target = Target(name="local", kind=TargetKind.FILE, location="/backups/x.tar.gz", freshness_hours=24)
-    result = AuditResult(results=(CheckResult(file_target, Status.MISSING, "file does not exist"),))
+    pattern = _stale_frequency_pattern("local")
+    observations = _observations_for("local", release_url=None, kind="file")
     transport = FakeTransport(
         [
             (200, {"posts_per_day": 2, "posts_used_today": 0}, {}),
             (201, {"url": "https://aiopscommunity.com/posts/x"}, {}),
         ]
     )
-    aiops.publish(result, "key", aiops.load_state(), transport=transport)
+    aiops.publish(pattern, observations, "key", aiops.load_state(), transport=transport)
     post_call = transport.calls[-1]
     assert "source_url" not in post_call["json_body"]
 
 
 def test_publish_skips_when_already_published():
+    pattern = _stale_frequency_pattern()
     state = aiops.load_state()
-    state["published"].append(aiops._finding_id(_material_result()))
+    state["published"].append(aiops._pattern_id(pattern))
     transport = FakeTransport([])
-    aiops.publish(_material_result(), "key", state, transport=transport)
+    aiops.publish(pattern, _observations_for(pattern["target_names"][0]), "key", state, transport=transport)
     assert transport.calls == []
 
 
 def test_publish_422_records_rejection_and_does_not_retry():
+    pattern = _stale_frequency_pattern()
+    observations = _observations_for(pattern["target_names"][0])
     transport = FakeTransport(
         [
             (200, {"posts_per_day": 2, "posts_used_today": 0}, {}),
@@ -250,26 +297,30 @@ def test_publish_422_records_rejection_and_does_not_retry():
         ]
     )
     state = aiops.load_state()
-    aiops.publish(_material_result(), "key", state, transport=transport)
-    finding_id = aiops._finding_id(_material_result())
+    aiops.publish(pattern, observations, "key", state, transport=transport)
+    finding_id = aiops._pattern_id(pattern)
     assert state["rejected"][finding_id] == "too_vague"
     assert finding_id not in state["published"]
 
-    # A second run with the same finding must not resubmit.
+    # A second run with the same pattern must not resubmit.
     transport2 = FakeTransport([])
-    aiops.publish(_material_result(), "key", aiops.load_state(), transport=transport2)
+    aiops.publish(pattern, observations, "key", aiops.load_state(), transport=transport2)
     assert transport2.calls == []
 
 
 def test_publish_skips_when_quota_spent():
+    pattern = _stale_frequency_pattern()
+    observations = _observations_for(pattern["target_names"][0])
     transport = FakeTransport([(200, {"posts_per_day": 2, "posts_used_today": 2}, {})])
     state = aiops.load_state()
-    aiops.publish(_material_result(), "key", state, transport=transport)
+    aiops.publish(pattern, observations, "key", state, transport=transport)
     assert state["published"] == []
     assert len(transport.calls) == 1  # only the quota check, no POST
 
 
 def test_publish_503_does_not_record_anything():
+    pattern = _stale_frequency_pattern()
+    observations = _observations_for(pattern["target_names"][0])
     transport = FakeTransport(
         [
             (200, {"posts_per_day": 2, "posts_used_today": 0}, {}),
@@ -277,7 +328,7 @@ def test_publish_503_does_not_record_anything():
         ]
     )
     state = aiops.load_state()
-    aiops.publish(_material_result(), "key", state, transport=transport)
+    aiops.publish(pattern, observations, "key", state, transport=transport)
     assert state["published"] == []
     assert state["rejected"] == {}
 
@@ -286,13 +337,15 @@ def test_publish_logs_full_response_body_on_any_non_201(capsys):
     # Added after the 2026-08-24 outage: the code used to print a fixed
     # message on 503 with no visibility into the actual response body.
     # Whatever the transport returns must now show up in the output.
+    pattern = _stale_frequency_pattern()
+    observations = _observations_for(pattern["target_names"][0])
     transport = FakeTransport(
         [
             (200, {"posts_per_day": 2, "posts_used_today": 0}, {}),
             (503, {"_raw_body": "<html>upstream error</html>"}, {}),
         ]
     )
-    aiops.publish(_material_result(), "key", aiops.load_state(), transport=transport)
+    aiops.publish(pattern, observations, "key", aiops.load_state(), transport=transport)
     out = capsys.readouterr().out
     assert "503" in out
     assert "upstream error" in out
@@ -303,13 +356,14 @@ def test_publish_logs_full_response_body_on_any_non_201(capsys):
 # ------------------------------------------------------------------
 
 
-def test_join_discussion_skips_when_healthy():
+def test_join_discussion_skips_when_no_pattern():
     transport = FakeTransport([])
-    aiops.join_discussion(_healthy_result(), "key", aiops.load_state(), transport=transport)
+    aiops.join_discussion(None, "key", aiops.load_state(), transport=transport)
     assert transport.calls == []
 
 
 def test_join_discussion_replies_to_live_edge_of_thread():
+    pattern = _stale_frequency_pattern()
     transport = FakeTransport(
         [
             (200, {"data": [{"id": 1, "slug": "backup-drills", "title": "Backup drills", "excerpt": "", "agent": "other"}]}, {}),
@@ -318,7 +372,7 @@ def test_join_discussion_replies_to_live_edge_of_thread():
         ]
     )
     state = aiops.load_state()
-    aiops.join_discussion(_material_result(), "key", state, transport=transport)
+    aiops.join_discussion(pattern, "key", state, transport=transport)
     assert str(1) in state["commented_on"]
     post_call = transport.calls[-1]
     assert post_call["json_body"]["reply_to"] == 55
@@ -326,6 +380,7 @@ def test_join_discussion_replies_to_live_edge_of_thread():
 
 
 def test_join_discussion_falls_back_to_top_level_when_no_thread_yet():
+    pattern = _stale_frequency_pattern()
     transport = FakeTransport(
         [
             (200, {"data": [{"id": 2, "slug": "dr-basics", "title": "Disaster recovery basics", "excerpt": "", "agent": "other"}]}, {}),
@@ -334,24 +389,26 @@ def test_join_discussion_falls_back_to_top_level_when_no_thread_yet():
         ]
     )
     state = aiops.load_state()
-    aiops.join_discussion(_material_result(), "key", state, transport=transport)
+    aiops.join_discussion(pattern, "key", state, transport=transport)
     post_call = transport.calls[-1]
     assert "reply_to" not in post_call["json_body"]
 
 
 def test_join_discussion_respects_24h_cooldown():
+    pattern = _stale_frequency_pattern()
     state = aiops.load_state()
     state["commented_on"]["1"] = datetime.now(timezone.utc).isoformat()
     transport = FakeTransport([(200, {"data": [{"id": 1, "slug": "x", "title": "backup drift", "excerpt": "", "agent": "other"}]}, {})])
-    aiops.join_discussion(_material_result(), "key", state, transport=transport)
+    aiops.join_discussion(pattern, "key", state, transport=transport)
     # Only the listing call happens; the article is filtered out before
     # its detail page (and definitely before posting) is ever fetched.
     assert len(transport.calls) == 1
 
 
 def test_join_discussion_skips_own_articles():
+    pattern = _stale_frequency_pattern()
     transport = FakeTransport([(200, {"data": [{"id": 9, "slug": "x", "title": "backup drift", "excerpt": "", "agent": aiops.AGENT_SLUG}]}, {})])
-    aiops.join_discussion(_material_result(), "key", aiops.load_state(), transport=transport)
+    aiops.join_discussion(pattern, "key", aiops.load_state(), transport=transport)
     assert len(transport.calls) == 1  # listing only, no detail/post fetch for our own article
 
 
@@ -376,6 +433,37 @@ def test_heartbeat_skips_when_not_due():
     transport = FakeTransport([])
     aiops.heartbeat("key", state, transport=transport)
     assert transport.calls == []
+
+
+# ------------------------------------------------------------------
+# run() -- wiring history recording into the publish decision
+# ------------------------------------------------------------------
+
+
+def test_run_records_observation_and_publishes_nothing_with_empty_history(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(aiops, "STATE_FILE", tmp_path / "aiops_community.json")
+    import backup_audit.aiops_history as history
+
+    monkeypatch.setattr(history, "HISTORY_FILE", tmp_path / "audit_history.json")
+    transport = FakeTransport([(200, {"your_account": {"posts_used_today": 0, "posts_per_day": 2}}, {})])
+
+    aiops.run(_material_result(), "key", transport=transport)
+
+    out = capsys.readouterr().out
+    assert "publishing nothing" in out
+    assert history.load_history() != []  # this run's observation was recorded
+
+
+def test_run_dry_run_does_not_record_observation(tmp_path, monkeypatch):
+    monkeypatch.setattr(aiops, "STATE_FILE", tmp_path / "aiops_community.json")
+    import backup_audit.aiops_history as history
+
+    monkeypatch.setattr(history, "HISTORY_FILE", tmp_path / "audit_history.json")
+    transport = FakeTransport([])
+
+    aiops.run(_material_result(), "key", transport=transport, dry_run=True)
+
+    assert not (tmp_path / "audit_history.json").exists()
 
 
 # ------------------------------------------------------------------

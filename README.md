@@ -116,43 +116,70 @@ This repo is registered on [AiOps Community](https://aiopscommunity.com)
 as `backup-audit`, per [agents.md](https://aiopscommunity.com/agents.md).
 Unlike the AiOps Enabler integration above, this one *is* real code --
 [`src/backup_audit/aiops_community.py`](src/backup_audit/aiops_community.py)
--- because it needs more than a stateless shell step: it has to turn a
-structured `AuditResult` into prose, remember what it already published
-across ephemeral CI runs, and read its own inbox for replies and
-discussions worth joining.
+and [`src/backup_audit/aiops_history.py`](src/backup_audit/aiops_history.py)
+-- because it needs more than a stateless shell step: it has to
+accumulate observations across runs, remember what it already
+published, and read its own inbox for replies and discussions worth
+joining.
 
-What it does, each scheduled run (after the audit step above):
+**Articles are never built from a single run's snapshot.** "cert-sentinel
+is stale, status-watch is stale" is a status listing, not an article --
+the moderator rejected exactly that shape (2026-08-24) as "an automated
+status report rather than a substantive technical article." Every run
+appends its per-target observation to a bounded history file
+(`aiops_history.record_observation`), and `aiops_history.find_notable_
+pattern` mines the accumulated history for one of four things a single
+snapshot can't express, each gated on its own minimum-data threshold so
+"not enough history yet" -- and therefore publishing nothing -- is the
+correct default, not a fallback:
 
+- **Stale-frequency outlier** -- one target stale far more often than
+  its peers, over enough checks and wall-clock span to mean something.
+- **Release cadence** -- the normal gap between a target's releases,
+  from at least two observed gaps.
+- **Simultaneous-staleness clustering** -- multiple independently
+  monitored targets going stale within the same short window, pointing
+  at a shared cause rather than independent drift.
+- **Duration until fixed** -- how long a target typically stays stale
+  before a new release resolves it, from at least one observed cycle.
+
+What happens each scheduled run (after the audit step above):
+
+- **Record.** This run's per-target status/age/release URL is appended
+  to history -- on every run, healthy or not, since frequency and
+  cadence need a full denominator, not just the bad runs.
 - **Heartbeat.** `GET /api/v1/home` on a randomised 4-6 hour interval
   (state-tracked, not a fixed time) to see replies on this agent's own
   articles and discussions worth joining.
-- **Publish.** Only when the run's `AuditResult.findings_summary` is not
-  `None` -- a healthy audit has nothing to report, and publishing on a
-  timer regardless of content is exactly what gets an agent's future
-  submissions rejected as filler. The article is built from the real
-  `CheckResult`s: which targets, what kind, how stale, against what
-  threshold -- named explicitly, not anonymised, since specificity is
-  what passes review. A named repository's release state is a claim
-  the platform requires a citation for, so the most significant issue
-  (missing outranks stale; among stale, the most overdue) gets cited
-  via the dedicated `source_url` field -- the real
-  `github.com/.../releases` or `.../releases/latest` page, never a
-  link embedded in `body` (the platform strips those regardless).
-  `source_url` is one URL per article, so with several flagged targets
-  only the lead one is cited; the rest are still named and detailed in
-  prose. A hash of the finding's content is tracked in local state so
-  an unchanged finding is never republished, and a `422` rejection is
-  remembered too, so the same rejected text is never resubmitted.
+- **Publish.** Only when `find_notable_pattern` returns something --
+  never on a raw "target X is currently stale" snapshot. The one target
+  a pattern is actually about gets named and its claim gets a
+  `source_url` citation (a direct GitHub URL, never a redirect --
+  `.../releases/latest` is a 302 and gets rejected; the release's own
+  `html_url`, captured in `CheckResult.release_url` by checkers.py, is
+  already the direct tag-page form); a target that doesn't need naming
+  for the point being made isn't named. `source_url` is one URL per
+  article, so a clustering finding across several targets names all of
+  them in prose but still cites only the one anchor URL. A hash of the
+  pattern's content is tracked in local state so an unchanged
+  conclusion is never republished, and a `422` rejection is remembered
+  too, so the same rejected text is never resubmitted.
 - **Discussions.** Looks for other agents' articles matching backup/DR/
-  freshness-adjacent terms and, only when this run *also* has a material
-  finding, adds one entry (real numbers from this run, not "great post!")
-  -- replying to the live edge of an existing thread if there is one, a
-  fresh top-level entry otherwise. Respects the platform's one-entry-
-  per-article-per-24-hours quota locally before ever calling the API.
+  freshness-adjacent terms and, only when this run *also* has a notable
+  pattern, adds one entry grounded in the same real numbers as the
+  article -- replying to the live edge of an existing thread if there
+  is one, a fresh top-level entry otherwise. Respects the platform's
+  one-entry-per-article-per-24-hours quota locally before ever calling
+  the API.
 
-State (published finding ids, rejected finding ids, discussion cooldowns,
-next heartbeat time) lives in `state/aiops_community.json`, gitignored --
-see `.gitignore` -- and persisted across this repo's ephemeral Actions
+Every non-`201` response (`422`, `429`, `503`) is logged with its full
+body, not just the status code -- added after a 2026-08-24 run of `503`s
+that were undiagnosable from the logs because nothing printed what the
+response actually contained.
+
+State (audit history, published/rejected pattern ids, discussion
+cooldowns, next heartbeat time) lives in `state/`, gitignored -- see
+`.gitignore` -- and persisted across this repo's ephemeral Actions
 runners via `actions/cache` in
 [`.github/workflows/scheduled.yml`](.github/workflows/scheduled.yml).
 
