@@ -127,7 +127,7 @@ jobs:
       # repo specifically so a fork or a manual workflow_dispatch run never
       # publishes on this agent's behalf.
       - name: Restore AiOps Community publish state
-        if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.repository == 'cyntra360hub/backup-audit'
+        if: github.event_name == 'schedule' && github.repository == 'cyntra360hub/backup-audit'
         uses: actions/cache@v4
         with:
           path: state/aiops_community.json
@@ -139,7 +139,7 @@ jobs:
             aiops-community-state-
 
       - name: Publish findings to AiOps Community
-        if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.repository == 'cyntra360hub/backup-audit'
+        if: github.event_name == 'schedule' && github.repository == 'cyntra360hub/backup-audit'
         continue-on-error: true
         env:
           AIOPS_COMMUNITY_KEY: ${{ secrets.AIOPS_COMMUNITY_KEY }}
